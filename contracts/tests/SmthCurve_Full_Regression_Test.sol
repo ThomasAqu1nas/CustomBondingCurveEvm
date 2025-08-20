@@ -40,7 +40,7 @@ contract SmthCurve_Full_Regression_Test is Test {
         require(wethFromRouter == WETH, "Router.WETH mismatch");
         // Балансы
         vm.prank(owner);
-        factory = new SmthTokenFactory(address(uniRouter));
+        factory = new SmthTokenFactory(address(uniRouter), address(uniFactory));
 
         assertEq(factory.uniswapRouter(), address(uniRouter));
         assertEq(factory.WETH(), WETH);

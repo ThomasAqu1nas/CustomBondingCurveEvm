@@ -15,6 +15,7 @@ interface ISmthTokenFactory {
     error SmthTokenFactory_TransferFailed();
     error SmthTokenFactory_NotInitialized();
     error SmthTokenFactory_InvalidBpsDenominator(uint256 bpsDenominator);
+    error SmthTokenFactory_InvalidDecimals(uint8 decimals);
     error SmthTokenFactory_InvalidInitialRatio(uint256 initialRatioBps, uint256 denominator);
     error SmthTokenFactory_TradeFeeTooHigh(uint256 tradeFeeBps, uint256 denominator);
     error SmthTokenFactory_MigrationFeeTooHigh(uint256 migrationFeeWad); // must be < 1e18
@@ -29,29 +30,27 @@ interface ISmthTokenFactory {
     error SmthTokenFactory_InvalidVirtualReservesForMigration(uint256 vS, uint256 vT);
     error SmthTokenFactory_InsufficientTokenBalanceForLP(uint256 required, uint256 actual);
 
+    /// @notice Global configuration used on token launch and fee accounting.
     // -------------------- Config --------------------
 
-    /// @notice Global configuration used on token launch and fee accounting.
+    /// @notice Total supply to be minted at token launch (18 decimals).
+    function totalSupply() external view returns(uint256);
+
     /// @dev `migrationFeeNumerator` is a WAD fraction (0..1e18), others are BPS or raw integers.
-    struct Config {
-        /// @notice Total supply to be minted at token launch (18 decimals).
-        uint256 totalSupply;
+    /// @notice Migration fee fraction in WAD (e.g., 0.05e18 = 5%).
+    function migrationFeeNumerator() external view returns(uint256);
 
-        /// @notice Migration fee fraction in WAD (e.g., 0.05e18 = 5%).
-        uint256 migrationFeeNumerator;
+    /// @notice Trading fee in basis points (e.g., 100 = 1%).
+    function tradeFeeBpsNumerator() external view returns(uint256);
 
-        /// @notice Trading fee in basis points (e.g., 100 = 1%).
-        uint256 tradeFeeBpsNumerator;
+    /// @notice BPS denominator, typically 10_000.
+    function defaultBpsDenominator() external view returns(uint256);
 
-        /// @notice BPS denominator, typically 10_000.
-        uint256 defaultBpsDenominator;
+    /// @notice Token decimals (for display/metadata; the math assumes 18 decimals).
+    function tokenDecimals() external view returns(uint8);
 
-        /// @notice Token decimals (for display/metadata; the math assumes 18 decimals).
-        uint256 tokenDecimals;
-
-        /// @notice Whether the config has been initialized.
-        bool isInitialized;
-    }
+    /// @notice Whether the config has been initialized.
+    function isInitialized() external view returns(uint8);
 
     // -------------------- TokenInfo --------------------
 
@@ -108,6 +107,8 @@ interface ISmthTokenFactory {
         uint256 vReserveToken,
         uint256 rReserveEth,
         uint256 rReserveToken,
+        uint256 initialRatio,
+        uint256 initialAmmEthAmount,
         address indexed creator
     );
 
@@ -154,6 +155,7 @@ interface ISmthTokenFactory {
     /// @notice Emitted after migrating liquidity to an AMM.
     event SmthTokenFactory__LiquiditySwapped(
         address indexed token,
+        address indexed pair,
         uint256 tokenAmount,
         uint256 ethAmount
     );
@@ -168,6 +170,9 @@ interface ISmthTokenFactory {
 
     /// @notice UniswapV2 router address used for liquidity migration.
     function uniswapRouter() external view returns (address);
+
+    /// @notice UniswapV2 factory address used for pair address calc.
+    function uniswapV2Factory() external view returns (address);
 
     /// @notice WETH address for the configured router.
     function WETH() external view returns (address);

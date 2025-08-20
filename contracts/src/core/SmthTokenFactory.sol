@@ -9,6 +9,7 @@ import {IUniswapV2Router02} from "../uniswap-v2/periphery/interfaces/IUniswapV2R
 import {SmthToken} from "./SmthToken.sol";
 import {ISmthTokenFactory} from "../interfaces/ISmthTokenFactory.sol";
 import {FixedPointMathLib} from "../../../lib/FixedPointMathLib.sol";
+import {UniswapV2Library} from "../uniswap-v2/libraries/UniswapV2Library.sol";
 
 /// @title SmthTokenFactory
 /// @notice Bonding-curve trading with fixed-supply token, partial-fill buys, and delayed migration to Uniswap V2.
@@ -16,19 +17,28 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
     using FixedPointMathLib for uint256;
     using SafeERC20 for IERC20;
 
+    // ------------- Config -------------
+    uint256 public totalSupply;
+    uint256 public migrationFeeNumerator;
+    uint256 public tradeFeeBpsNumerator;
+    uint256 public defaultBpsDenominator;
+    uint8 public tokenDecimals;
+    uint8 public isInitialized;
+
 
     // ------------- Storage -------------
     mapping(address => TokenInfo) private tokens; // token => info
 
     address private _uniswapRouter;
+    address private _uniswapV2Factory;
     address private _WETH;
     uint256 private _totalFee;
-    Config  private _config;
 
     // ------------- Constructor / Admin -------------
-    constructor(address router_) Ownable(_msgSender()) {
+    constructor(address router_, address uniswapV2Factory_) Ownable(_msgSender()) {
         if (router_ == address(0)) revert SmthTokenFactory__ZeroAddress();
         _uniswapRouter = router_;
+        _uniswapV2Factory = uniswapV2Factory_;
         _WETH = IUniswapV2Router02(router_).WETH();
 
         setConfig(
@@ -45,24 +55,28 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         uint256 migrationFeeNumerator_,   // WAD fraction in [0..1e18)
         uint256 tradeFeeBpsNumerator_,    // BPS (0..10000)
         uint256 bpsDenominator_,          // usually 10_000
-        uint256 tokenDecimals_            // 18
+        uint8 tokenDecimals_            // 18
     ) public onlyOwner {
         if (bpsDenominator_ == 0) revert SmthTokenFactory_InvalidBpsDenominator(bpsDenominator_);
-        _config = Config({
-            totalSupply: totalSupply_,
-            migrationFeeNumerator: migrationFeeNumerator_,
-            tradeFeeBpsNumerator: tradeFeeBpsNumerator_,
-            defaultBpsDenominator: bpsDenominator_,
-            tokenDecimals: tokenDecimals_,
-            isInitialized: true
-        });
+        totalSupply = totalSupply_;
+        migrationFeeNumerator = migrationFeeNumerator_;
+        tradeFeeBpsNumerator = tradeFeeBpsNumerator_;
+        defaultBpsDenominator = bpsDenominator_;
+        tokenDecimals = tokenDecimals_;
+        isInitialized = 255;
     }
 
     // ------------- Views -------------
     function tokenInfo(address token) external view override returns (TokenInfo memory) { return tokens[token]; }
     function uniswapRouter() external view override returns (address) { return _uniswapRouter; }
+    function uniswapV2Factory() external view override returns (address) { return _uniswapV2Factory; }
     function WETH() external view override returns (address) { return _WETH; }
     function totalFee() external view override returns (uint256) { return _totalFee; }
+
+    // ------------- Pair address calc helper -------------
+    function _getPairAddress(address token_) private view returns(address) {
+        return UniswapV2Library.pairFor(_uniswapV2Factory, token_, _WETH);
+    }
 
     // ------------- Launch -------------
     /// @notice Deploy token (full supply to factory) and initialize curve reserves so that:
@@ -76,20 +90,20 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         uint256 initialAmmEthAmount_, // GROSS ETH expected to be raised on the curve before migration
         uint256 initialRatio_         // BPS: e.g. 1000 = 10% to AMM
     ) external payable nonReentrant returns (address tokenAddress) {
-        if (!_config.isInitialized) revert SmthTokenFactory_NotInitialized();
+        if (isInitialized == 0) revert SmthTokenFactory_NotInitialized();
         if (initialAmmEthAmount_ == 0) revert SmthTokenFactory__ZeroAmount();
-        if (initialRatio_ == 0 || initialRatio_ >= _config.defaultBpsDenominator) {
-            revert SmthTokenFactory_InvalidInitialRatio(initialRatio_, _config.defaultBpsDenominator);
+        if (initialRatio_ == 0 || initialRatio_ >= defaultBpsDenominator) {
+            revert SmthTokenFactory_InvalidInitialRatio(initialRatio_, defaultBpsDenominator);
         }
-        if (_config.tradeFeeBpsNumerator >= _config.defaultBpsDenominator) {
-            revert SmthTokenFactory_TradeFeeTooHigh(_config.tradeFeeBpsNumerator, _config.defaultBpsDenominator);
+        if (tradeFeeBpsNumerator >= defaultBpsDenominator) {
+            revert SmthTokenFactory_TradeFeeTooHigh(tradeFeeBpsNumerator, defaultBpsDenominator);
         }
-        if (_config.migrationFeeNumerator >= 1e18) {
-            revert SmthTokenFactory_MigrationFeeTooHigh(_config.migrationFeeNumerator);
+        if (migrationFeeNumerator >= 1e18) {
+            revert SmthTokenFactory_MigrationFeeTooHigh(migrationFeeNumerator);
         }
 
         // 1) Deploy token (mints full supply to this factory)
-        SmthToken token = new SmthToken(name_, symbol_, _config.totalSupply);
+        SmthToken token = new SmthToken(name_, symbol_, totalSupply);
 
         // 2) Fill per-token metadata
         TokenInfo storage info = tokens[address(token)];
@@ -98,8 +112,8 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         info.name = name_;
         info.symbol = symbol_;
         info.uri = uri_;
-        info.tokenTotalSupply = _config.totalSupply;
-        info.tokenDecimals = _config.tokenDecimals;
+        info.tokenTotalSupply = totalSupply;
+        info.tokenDecimals = tokenDecimals;
 
         // 3) Initialize curve virtual/real reserves per Solana logic
         _initReserves(info, initialAmmEthAmount_, initialRatio_);
@@ -108,6 +122,7 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
             address(token), name_, symbol_, uri_,
             info.vEthReserves, info.vTokenReserves,
             info.rEthReserves, info.rTokenReserves,
+            initialRatio_, initialAmmEthAmount_,
             _msgSender()
         );
 
@@ -135,18 +150,18 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         uint256 initialRatioBps  // share to AMM in BPS
     ) private {
         // Split supply
-        uint256 T = (_config.totalSupply * initialRatioBps) / _config.defaultBpsDenominator; // to AMM
-        uint256 R = _config.totalSupply - T;                                                 // curve inventory
+        uint256 T = (totalSupply * initialRatioBps) / defaultBpsDenominator; // to AMM
+        uint256 R = totalSupply - T;                                                 // curve inventory
         if (T == 0 || R == 0) revert SmthTokenFactory_InvalidTR(T, R);
 
         // Net ETH to accumulate on curve before migration (after trade fee)
-        uint256 SS = _netFromGross(gross, _config.defaultBpsDenominator, _config.tradeFeeBpsNumerator);
-        if (SS == 0) revert SmthTokenFactory_NetRaiseZero(gross, _config.tradeFeeBpsNumerator);
+        uint256 SS = _netFromGross(gross, defaultBpsDenominator, tradeFeeBpsNumerator);
+        if (SS == 0) revert SmthTokenFactory_NetRaiseZero(gross, tradeFeeBpsNumerator);
 
         // S = floor( SS / (1 + m) ), m is WAD
-        uint256 onePlusM = 1e18 + _config.migrationFeeNumerator;
+        uint256 onePlusM = 1e18 + migrationFeeNumerator;
         uint256 S = FixedPointMathLib.divWadDown(SS, onePlusM);
-        if (S == 0) revert SmthTokenFactory_BaseRaiseZero(SS, _config.migrationFeeNumerator);
+        if (S == 0) revert SmthTokenFactory_BaseRaiseZero(SS, migrationFeeNumerator);
 
         // Feasibility: S*R > SS*T
         uint256 SR  = FixedPointMathLib.mulDivDown(S, R, 1);
@@ -265,7 +280,7 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         uint256 grossEthOut = info.vEthReserves - newReserveEth;
         if (grossEthOut == 0) revert SmthTokenFactory_InsufficientOutputAmount(0);
 
-        uint256 fee = (grossEthOut * _config.tradeFeeBpsNumerator) / _config.defaultBpsDenominator;
+        uint256 fee = (grossEthOut * tradeFeeBpsNumerator) / defaultBpsDenominator;
         uint256 netEthOut = grossEthOut - fee;
 
         if (grossEthOut > info.rEthReserves) revert SmthTokenFactory_InsufficientFundsInProtocol();
@@ -311,7 +326,7 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
 
         // Try full fill with all valueWei
         {
-            C.ethNetMax = _netFromGross(valueWei, _config.defaultBpsDenominator, _config.tradeFeeBpsNumerator);
+            C.ethNetMax = _netFromGross(valueWei, defaultBpsDenominator, tradeFeeBpsNumerator);
             (C.newS, C.newT, C.outAmt) = _fullFillOutcome(info.vEthReserves, info.vTokenReserves, C.ethNetMax);
 
             if (C.outAmt <= info.rTokenReserves) {
@@ -347,8 +362,8 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
                 info.vEthReserves,
                 info.vTokenReserves,
                 info.rTokenReserves,
-                _config.defaultBpsDenominator,
-                _config.tradeFeeBpsNumerator
+                defaultBpsDenominator,
+                tradeFeeBpsNumerator
             );
 
         if (C.ethGrossNeeded > valueWei) revert SmthTokenFactory_InsufficientEthForPartialFill(C.ethGrossNeeded, valueWei);
@@ -400,7 +415,7 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         uint256 ethNeeded = (tokenToLP * info.vEthReserves) / info.vTokenReserves;
 
         // Migration fee (WAD)
-        uint256 fee = ethNeeded.mulWadDown(_config.migrationFeeNumerator);
+        uint256 fee = ethNeeded.mulWadDown(migrationFeeNumerator);
 
         // Ensure enough ETH
         uint256 available = info.rEthReserves;
@@ -409,7 +424,7 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
             if (maxEthForPool == 0) revert SmthTokenFactory_NotEnoughFunds();
             tokenToLP = (tokenToLP * maxEthForPool) / ethNeeded;
             ethNeeded = maxEthForPool;
-            fee = ethNeeded.mulWadDown(_config.migrationFeeNumerator);
+            fee = ethNeeded.mulWadDown(migrationFeeNumerator);
         }
         if (tokenToLP == 0 || ethNeeded == 0) revert SmthTokenFactory_NotEnoughFunds();
 
@@ -438,7 +453,9 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
             info.liquidityMigrated = true;
         }
 
-        emit SmthTokenFactory__LiquiditySwapped(_token, amountToken, amountETH);
+        address craetedUniswapV2Pair = _getPairAddress(_token);
+
+        emit SmthTokenFactory__LiquiditySwapped(_token, craetedUniswapV2Pair, amountToken, amountETH);
     }
 
     // ------------- Fees -------------
