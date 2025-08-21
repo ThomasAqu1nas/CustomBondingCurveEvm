@@ -29,6 +29,7 @@ interface ISmthTokenFactory {
     error SmthTokenFactory_InsufficientEthForPartialFill(uint256 neededGrossWei, uint256 providedWei);
     error SmthTokenFactory_InvalidVirtualReservesForMigration(uint256 vS, uint256 vT);
     error SmthTokenFactory_InsufficientTokenBalanceForLP(uint256 required, uint256 actual);
+    error SmthTokenFactory_InitialLiquidityAlreadyLocked();
 
     /// @notice Global configuration used on token launch and fee accounting.
     // -------------------- Config --------------------
@@ -62,7 +63,7 @@ interface ISmthTokenFactory {
 
         /// @notice Launched token address (ERC20-like).
         address tokenAddress;
-
+        address calculatedPairAddress;
         /// @notice Token metadata (not enforced on-chain here).
         string name;
         string symbol;
@@ -93,6 +94,7 @@ interface ISmthTokenFactory {
         /// @notice True once the bonding-curve is completed (e.g., after final mint/migration).
         bool isCompleted;
         bool liquidityMigrated;
+        bool liquidityLocked;
     }
 
     // -------------------- Events --------------------
@@ -160,6 +162,8 @@ interface ISmthTokenFactory {
         uint256 ethAmount
     );
 
+    event SmthTokenFactory__LiquidityLocked(address indexed token, address indexed pair, uint256 lockedLiquidity);
+
     /// @notice Emitted after claiming accumulated protocol fees.
     event SmthTokenFactory__ClaimedFee(uint256 amount);
 
@@ -180,6 +184,8 @@ interface ISmthTokenFactory {
     /// @notice Accumulated protocol fees (in ETH).
     function totalFee() external view returns (uint256);
 
+    function lockedLiquidity() external view returns (uint256);
+
     // -------------------- Actions --------------------
 
     /// @notice Launch a new token with bonding-curve parameters baked into virtual/real reserves.
@@ -196,6 +202,8 @@ interface ISmthTokenFactory {
         uint256 initialAmmEthAmount_,
         uint256 initialRatio_
     ) external payable returns (address tokenAddress);
+
+    function finalizeAndMigrate(address token_) external;
 
     /// @notice Buy tokens for ETH against the bonding curve.
     function buyToken(address _token) external payable;

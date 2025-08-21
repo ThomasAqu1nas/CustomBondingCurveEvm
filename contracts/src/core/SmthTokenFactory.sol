@@ -6,6 +6,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IUniswapV2Router02} from "../uniswap-v2/periphery/interfaces/IUniswapV2Router02.sol";
+import {IUniswapV2Pair} from "../uniswap-v2/core/interfaces/IUniswapV2Pair.sol";
 import {SmthToken} from "./SmthToken.sol";
 import {ISmthTokenFactory} from "../interfaces/ISmthTokenFactory.sol";
 import {FixedPointMathLib} from "../../../lib/FixedPointMathLib.sol";
@@ -22,9 +23,12 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
     uint256 public migrationFeeNumerator;
     uint256 public tradeFeeBpsNumerator;
     uint256 public defaultBpsDenominator;
+    uint256 public lockedLiquidity;
     uint8 public tokenDecimals;
     uint8 public isInitialized;
 
+    uint8 public autoMigrate;
+    uint8 public autoLock;
 
     // ------------- Storage -------------
     mapping(address => TokenInfo) private tokens; // token => info
@@ -46,16 +50,32 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
             62_500_000_000_000_000, // migrationFeeNumerator = 0.0625 WAD (example)
             100,                    // trade fee = 1% (BPS)
             10_000,                 // denominator
-            18                      // token decimals (display)
+            18,                      // token decimals (display)
+            0, 0
         );
+    }
+
+    function finalizeAndMigrate(address token_) external onlyOwner {
+        TokenInfo storage info = tokens[token_];
+        if (info.rTokenReserves == 0 && !info.isCompleted) {
+            info.isCompleted = true;
+            if (autoMigrate == 255) _finalizeAndMigrate(info, info.ammTokenReserves);
+        }
+    }
+
+    function permanentLockLiquidity(address token_) external onlyOwner {
+        TokenInfo storage info = tokens[token_];
+        _permanentLockInitialLiquidity(info);
     }
 
     function setConfig(
         uint256 totalSupply_,
-        uint256 migrationFeeNumerator_,   // WAD fraction in [0..1e18)
-        uint256 tradeFeeBpsNumerator_,    // BPS (0..10000)
-        uint256 bpsDenominator_,          // usually 10_000
-        uint8 tokenDecimals_            // 18
+        uint256 migrationFeeNumerator_,     // WAD fraction in [0..1e18)
+        uint256 tradeFeeBpsNumerator_,      // BPS (0..10000)
+        uint256 bpsDenominator_,            // usually 10_000
+        uint8 tokenDecimals_,               // 18
+        uint8 autoLock_,                    // 0/255
+        uint8 autoMigrate_                  // 0/255
     ) public onlyOwner {
         if (bpsDenominator_ == 0) revert SmthTokenFactory_InvalidBpsDenominator(bpsDenominator_);
         totalSupply = totalSupply_;
@@ -63,6 +83,8 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         tradeFeeBpsNumerator = tradeFeeBpsNumerator_;
         defaultBpsDenominator = bpsDenominator_;
         tokenDecimals = tokenDecimals_;
+        autoLock = autoLock_;
+        autoMigrate = autoMigrate_;
         isInitialized = 255;
     }
 
@@ -104,38 +126,22 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
 
         // 1) Deploy token (mints full supply to this factory)
         SmthToken token = new SmthToken(name_, symbol_, totalSupply);
+        address _tokenAddress = address(token);
+        TokenInfo storage info = tokens[_tokenAddress];
 
-        // 2) Fill per-token metadata
-        TokenInfo storage info = tokens[address(token)];
-        info.creator = _msgSender();
-        info.tokenAddress = address(token);
-        info.name = name_;
-        info.symbol = symbol_;
-        info.uri = uri_;
-        info.tokenTotalSupply = totalSupply;
-        info.tokenDecimals = tokenDecimals;
-
-        // 3) Initialize curve virtual/real reserves per Solana logic
-        _initReserves(info, initialAmmEthAmount_, initialRatio_);
-
-        emit SmthTokenFactory__TokenLaunched(
-            address(token), name_, symbol_, uri_,
-            info.vEthReserves, info.vTokenReserves,
-            info.rEthReserves, info.rTokenReserves,
-            initialRatio_, initialAmmEthAmount_,
-            _msgSender()
-        );
-
-        // 4) Optional immediate buy with msg.value (same rules as buyToken: fee, partial fill, refund)
+        // 2) Setup
+        _setupToken(info, name_, symbol_, uri_, initialAmmEthAmount_, initialRatio_);
+        
+        // 3) Optional immediate buy with msg.value (same rules as buyToken: fee, partial fill, refund)
         if (msg.value > 0) {
-            _buyWithValue(address(token), info, _msgSender(), msg.value);
+            _buyWithValue(info, _msgSender(), msg.value);
             if (info.rTokenReserves == 0 && !info.isCompleted) {
                 info.isCompleted = true;
-                finalizeAndMigrate(address(token), info.ammTokenReserves);
+                if (autoMigrate == 255) _finalizeAndMigrate(info, info.ammTokenReserves);
             }
         }
 
-        return address(token);
+        return _tokenAddress;
     }
 
     // ------------- Curve math helpers -------------
@@ -258,10 +264,10 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         if (msg.value == 0) revert SmthTokenFactory__ZeroAmount();
         TokenInfo storage info = tokens[_token];
         if (info.tokenAddress == address(0)) revert SmthTokenFactory__ZeroAddress();
-        _buyWithValue(_token, info, _msgSender(), msg.value);
+        _buyWithValue(info, _msgSender(), msg.value);
         if (info.rTokenReserves == 0 && !info.isCompleted) {
             info.isCompleted = true;
-            finalizeAndMigrate(_token, info.ammTokenReserves);
+            if (autoMigrate == 255) _finalizeAndMigrate(info, info.ammTokenReserves);
         }
     }
 
@@ -320,8 +326,8 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         uint256 R;
     }
 
-    function _buyWithValue(address _token, TokenInfo storage info, address buyer, uint256 valueWei) internal {
-        IERC20 tkn = IERC20(_token);
+    function _buyWithValue(TokenInfo storage info, address buyer, uint256 valueWei) internal {
+        IERC20 tkn = IERC20(info.tokenAddress);
         BuyCtx memory C;
 
         // Try full fill with all valueWei
@@ -344,7 +350,7 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
                 tkn.safeTransfer(buyer, C.outAmt);
 
                 emit SmthTokenFactory__TokensPurchased(
-                    _token, buyer, C.outAmt, valueWei,
+                    info.tokenAddress, buyer, C.outAmt, valueWei,
                     info.vEthReserves, info.vTokenReserves,
                     info.rEthReserves, info.rTokenReserves
                 );
@@ -388,7 +394,7 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         }
 
         emit SmthTokenFactory__TokensPurchased(
-            _token, buyer, C.R, C.ethGrossNeeded,
+            info.tokenAddress, buyer, C.R, C.ethGrossNeeded,
             info.vEthReserves, info.vTokenReserves,
             info.rEthReserves, info.rTokenReserves
         );
@@ -400,8 +406,7 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
 
     /// @notice Migrate a portion (or all) of `ammTokenReserves` to Uniswap V2 at the current curve price.
     /// @dev Curve remains active after migration. Migration fee policy is applied on protocol ETH.
-    function finalizeAndMigrate(address _token, uint256 tokenToLP) internal {
-        TokenInfo storage info = tokens[_token];
+    function _finalizeAndMigrate(TokenInfo storage info, uint256 tokenToLP) internal {
         if (info.tokenAddress == address(0)) revert SmthTokenFactory__ZeroAddress();
 
         if (tokenToLP == 0) revert SmthTokenFactory__ZeroAmount();
@@ -428,13 +433,13 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
         }
         if (tokenToLP == 0 || ethNeeded == 0) revert SmthTokenFactory_NotEnoughFunds();
 
-        IERC20 t = IERC20(_token);
+        IERC20 t = IERC20(info.tokenAddress);
         uint256 bal = t.balanceOf(address(this));
         if (bal < tokenToLP) revert SmthTokenFactory_InsufficientTokenBalanceForLP(tokenToLP, bal);
         t.forceApprove(_uniswapRouter, tokenToLP);
 
         (uint amountToken, uint amountETH, ) = IUniswapV2Router02(_uniswapRouter).addLiquidityETH{value: ethNeeded}(
-            _token,
+            info.tokenAddress,
             tokenToLP,
             (tokenToLP * 9900) / 10_000,
             (ethNeeded * 9900) / 10_000,
@@ -453,9 +458,43 @@ contract SmthTokenFactory is ISmthTokenFactory, Ownable, ReentrancyGuard {
             info.liquidityMigrated = true;
         }
 
-        address craetedUniswapV2Pair = _getPairAddress(_token);
+        emit SmthTokenFactory__LiquiditySwapped(info.tokenAddress, info.calculatedPairAddress, amountToken, amountETH);
 
-        emit SmthTokenFactory__LiquiditySwapped(_token, craetedUniswapV2Pair, amountToken, amountETH);
+        if (autoLock == 255) {
+            lockedLiquidity = _permanentLockInitialLiquidity(info);
+            emit SmthTokenFactory__LiquidityLocked(info.tokenAddress, info.calculatedPairAddress, lockedLiquidity);
+        }
+    }
+
+    function _permanentLockInitialLiquidity(TokenInfo storage info) internal onlyOwner returns(uint256 liquidity) {
+        if (!info.isCompleted || !info.liquidityMigrated || info.liquidityLocked) revert SmthTokenFactory_InitialLiquidityAlreadyLocked();
+        liquidity = IUniswapV2Pair(info.calculatedPairAddress).mint(address(0));
+    }
+
+    function _setupToken(
+        TokenInfo storage info,
+        string memory name_,
+        string memory symbol_,
+        string memory uri_,
+        uint256 initialAmmEthAmount_,
+        uint256 initialRatio_
+    ) private {
+        info.creator = _msgSender();
+        info.tokenAddress = info.tokenAddress;
+        info.name = name_;
+        info.symbol = symbol_;
+        info.uri = uri_;
+        info.tokenTotalSupply = totalSupply;
+        info.tokenDecimals = tokenDecimals;
+        info.calculatedPairAddress = _getPairAddress(info.tokenAddress);
+        _initReserves(info, initialAmmEthAmount_, initialRatio_);
+        emit SmthTokenFactory__TokenLaunched(
+            info.tokenAddress, name_, symbol_, uri_,
+            info.vEthReserves, info.vTokenReserves,
+            info.rEthReserves, info.rTokenReserves,
+            initialRatio_, initialAmmEthAmount_,
+            _msgSender()
+        );
     }
 
     // ------------- Fees -------------
